@@ -8,9 +8,10 @@
 // Same NVS layout as ESP32RXVoter, so flashing over an RX unit keeps its
 // settings. v3: ES8311 codec, GPS-locked audio timebase (Timing Offset is
 // now a trim, reset to 0), network interface selection, DSP RSSI
-// calibration, DSP squelch level/hysteresis. v4: transmit. Older versions
-// are migrated: new fields are only ever added at the end.
-#define CONFIG_VERSION 4
+// calibration, DSP squelch level/hysteresis. v4: transmit. v5: device
+// hostname. Older versions are migrated: new fields are only ever added at
+// the end.
+#define CONFIG_VERSION 7
 
 // Network interface selection
 #define NET_IFACE_AUTO 0 // Ethernet when a cable is connected, otherwise WiFi
@@ -84,6 +85,16 @@ struct SysConfig {
   bool pttInvert;     // false = GPIO HIGH keys the radio (through the transistor)
   uint16_t pttTailMs; // PTT hang after the last host audio packet
   uint16_t jitterMs;  // Jitter buffer start threshold
+
+  // This device's network name (v5): DHCP hostname, WiFi station name
+  char deviceHostname[32];
+
+  // DSP RSSI hold during voice, like the PIC DSPBEW option (v6):
+  // 0 off, 1 normal, 2 sensitive, 3 noise floor tracking
+  uint8_t dspBewMode;
+
+  // DSP noise band (v7): false = 2.8-4 kHz, true = 2.8-3.5 kHz
+  bool dspNarrowBand;
 };
 
 // GPS timing mode (u-blox LEA-5T CFG-TMODE)
@@ -100,20 +111,78 @@ struct GpsTimingConfig {
   uint32_t fixedAccMm;            // Fixed position accuracy (1 sigma)
 };
 
+// Position handed to the GPS at boot (UBX AID-INI) together with the network
+// time, so it searches for the right satellites. Own NVS key.
+struct GpsAidConfig {
+  bool set;
+  int32_t latE7, lonE7; // degrees * 1e7
+  int32_t altCm;
+};
+
+// Offline repeater (failover when the voter host is not connected).
+// Stored under its own NVS key like GpsTimingConfig.
+struct RptConfig {
+  bool enable;
+  uint16_t triggerS;  // not connected this long -> offline repeater
+  uint16_t hangMs;    // PTT hang after COS drops
+  uint16_t totS;      // timeout timer, 0 = off
+  uint8_t gainPct;    // repeated audio level
+  bool deemp;         // de-emphasize repeated audio (TX input pre-emphasizes)
+  bool courtesy;      // courtesy beep after each transmission
+  char idCall[16];    // CW ID, required to transmit
+  uint8_t idWpm;
+  uint16_t idFreqHz;
+  uint8_t idLevelPct; // CW ID / courtesy tone level, % of full scale
+  // Keep new fields at the end (older saved blocks are loaded as a prefix
+  // and the rest takes defaults)
+  uint16_t beepHz; // courtesy tone
+  uint16_t beepMs; // unused: the courtesy tone is Morse F at the ID speed
+  uint16_t bootDelayS; // no takeover until this long after power-up
+};
+
+// WireGuard remote access (split tunnel: only the tunnel subnet and the
+// remote subnets are routed through it). Own NVS key like RptConfig.
+#define WG_KEY_B64_LEN 44 // base64 of a 32-byte key
+#define WG_MAX_ROUTES 4
+struct WgConfig {
+  bool enable;
+  char privateKey[WG_KEY_B64_LEN + 4];    // this device, base64
+  char peerPublicKey[WG_KEY_B64_LEN + 4]; // server, base64
+  char presharedKey[WG_KEY_B64_LEN + 4];  // optional, empty = none
+  char endpoint[64];                      // server hostname or IP
+  uint16_t endpointPort;
+  uint32_t address;    // this device's tunnel IP
+  uint32_t netmask;    // tunnel subnet - routed through the tunnel
+  uint16_t keepaliveS; // persistent keepalive, 0 = off
+  // Remote subnets also routed through the tunnel (e.g. the LAN behind the
+  // server). Network byte order, same as address/netmask.
+  uint8_t nRoutes;
+  uint32_t routeNet[WG_MAX_ROUTES];
+  uint32_t routeMask[WG_MAX_ROUTES];
+};
+
 class ConfigManager {
 public:
   void begin();
   void save();
   void resetDefaults();
   void saveGpsTiming();
+  void saveGpsAid();
+  void saveRpt();
+  void saveWg();
 
   IPAddress hostIP() const { return IPAddress(data.hostIP); }
 
   SysConfig data;
   GpsTimingConfig gpsTm;
+  GpsAidConfig gpsAid;
+  RptConfig rpt;
+  WgConfig wg;
 
 private:
   void _gpsTimingDefaults();
+  void _rptDefaults();
+  void _wgDefaults();
 };
 
 extern ConfigManager cfg;

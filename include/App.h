@@ -12,6 +12,7 @@ struct RxStatus {
   volatile bool cos;                // Squelch open
   volatile uint8_t noise;           // DSP noise level (0-255)
   volatile float noiseRms;          // DSP noise RMS (Q15), the DSP RSSI input
+  volatile uint8_t rssiHeldPct;     // % of the last second the DSP RSSI was held (voice)
   volatile uint16_t rssiRaw;        // RSSI pin, raw ADC counts (0-4095)
   volatile int16_t adcPeak;         // Max |sample| over last second, before DSP
   volatile int16_t encPeak;         // Max |sample| over last second, after DSP
@@ -52,6 +53,7 @@ extern RssiCalMeasure g_rssiCal;
 // Map v to RSSI 0-255, linear between the no-signal and full-quieting
 // readings. Works either way round (RSSI voltage or noise falling with signal).
 uint8_t rssiFromCal(float v, float atNoSig, float atFull);
+void applyRadioConfig(); // apply Radio page changes without a reboot
 extern GPSManager gps;
 extern GpsAudio gpsAudio;
 extern VoterClient voter;

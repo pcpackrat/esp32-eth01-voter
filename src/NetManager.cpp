@@ -79,6 +79,13 @@ void NetManager::begin() {
     }
   });
 
+  // Device name for DHCP / WiFi. WiFi takes it from here when it starts;
+  // Ethernet is set in _startEth().
+  if (cfg.data.deviceHostname[0] != '\0') {
+    Network.setHostname(cfg.data.deviceHostname);
+    Serial.printf("[NET] Hostname: %s\r\n", cfg.data.deviceHostname);
+  }
+
   static const char *ifaceNames[] = {"Auto (Ethernet when cabled, else WiFi)", "Ethernet only", "WiFi only"};
   Serial.printf("[NET] Interface: %s\r\n", ifaceNames[cfg.data.netIface <= NET_IFACE_WIFI ? cfg.data.netIface : 0]);
 
@@ -123,6 +130,9 @@ void NetManager::_startEth() {
 
   ETH.begin(ETH_PHY_LAN8720, WT32_ETH_PHY_ADDR, WT32_ETH_PHY_MDC, WT32_ETH_PHY_MDIO,
             WT32_ETH_PHY_POWER, ETH_CLOCK_GPIO0_IN);
+  // Before the link comes up, so the first DHCP request carries the name
+  if (cfg.data.deviceHostname[0] != '\0')
+    ETH.setHostname(cfg.data.deviceHostname);
 
   if (cfg.data.useStaticIP) {
     ETH.config(IPAddress(cfg.data.staticIP), IPAddress(cfg.data.gateway),

@@ -34,6 +34,12 @@ void ConfigManager::begin() {
       data.pttTailMs = DEF_PTT_TAIL_MS;
       data.jitterMs = DEF_JITTER_MS;
     }
+    if (oldVersion < 5)
+      strlcpy(data.deviceHostname, DEF_DEVICE_HOSTNAME, sizeof(data.deviceHostname));
+    if (oldVersion < 6)
+      data.dspBewMode = DEF_DSP_BEW_MODE;
+    if (oldVersion < 7)
+      data.dspNarrowBand = false;
     save();
     Serial.printf("[Config] Migrated v%lu config from NVS\r\n", (unsigned long)oldVersion);
   } else if (len != sizeof(data) || data.magic != CONFIG_MAGIC ||
@@ -49,11 +55,70 @@ void ConfigManager::begin() {
   } else {
     _gpsTimingDefaults();
   }
+
+  memset(&gpsAid, 0, sizeof(gpsAid));
+  if (prefs.getBytesLength("gpsaid") == sizeof(gpsAid)) {
+    prefs.getBytes("gpsaid", &gpsAid, sizeof(gpsAid));
+  }
+
+  // Defaults first, then whatever was saved on top (an older, shorter block
+  // leaves the newer fields at their defaults)
+  _rptDefaults();
+  size_t rptLen = prefs.getBytesLength("rpt");
+  if (rptLen > 0 && rptLen <= sizeof(rpt)) {
+    prefs.getBytes("rpt", &rpt, rptLen);
+  }
+  _wgDefaults();
+  size_t wgLen = prefs.getBytesLength("wg");
+  if (wgLen > 0 && wgLen <= sizeof(wg)) {
+    prefs.getBytes("wg", &wg, wgLen);
+  }
+}
+
+void ConfigManager::saveRpt() {
+  prefs.putBytes("rpt", &rpt, sizeof(rpt));
+  Serial.println("[Config] Repeater settings saved to NVS");
+}
+
+void ConfigManager::_rptDefaults() {
+  memset(&rpt, 0, sizeof(rpt));
+  rpt.enable = DEF_RPT_ENABLE;
+  rpt.triggerS = DEF_RPT_TRIGGER_S;
+  rpt.hangMs = DEF_RPT_HANG_MS;
+  rpt.totS = DEF_RPT_TOT_S;
+  rpt.gainPct = DEF_RPT_GAIN_PCT;
+  rpt.deemp = DEF_RPT_DEEMP;
+  rpt.courtesy = DEF_RPT_COURTESY;
+  strlcpy(rpt.idCall, DEF_RPT_ID_CALL, sizeof(rpt.idCall));
+  rpt.idWpm = DEF_RPT_ID_WPM;
+  rpt.idFreqHz = DEF_RPT_ID_FREQ_HZ;
+  rpt.idLevelPct = DEF_RPT_ID_LEVEL_PCT;
+  rpt.beepHz = DEF_RPT_BEEP_HZ;
+  rpt.beepMs = DEF_RPT_BEEP_MS;
+  rpt.bootDelayS = DEF_RPT_BOOT_DELAY_S;
+}
+
+void ConfigManager::saveWg() {
+  prefs.putBytes("wg", &wg, sizeof(wg));
+  Serial.println("[Config] WireGuard settings saved to NVS");
+}
+
+void ConfigManager::_wgDefaults() {
+  memset(&wg, 0, sizeof(wg));
+  wg.enable = false;
+  wg.endpointPort = DEF_WG_PORT;
+  wg.netmask = (uint32_t)IPAddress(DEF_WG_NETMASK);
+  wg.keepaliveS = DEF_WG_KEEPALIVE_S;
 }
 
 void ConfigManager::saveGpsTiming() {
   prefs.putBytes("gpstm", &gpsTm, sizeof(gpsTm));
   Serial.println("[Config] GPS timing saved to NVS");
+}
+
+void ConfigManager::saveGpsAid() {
+  prefs.putBytes("gpsaid", &gpsAid, sizeof(gpsAid));
+  Serial.println("[Config] GPS aiding position saved to NVS");
 }
 
 void ConfigManager::_gpsTimingDefaults() {
@@ -100,6 +165,8 @@ void ConfigManager::resetDefaults() {
   data.dspRmsFull = 0.0f;
   data.dspSqlOpen = DEF_DSP_SQL_OPEN;
   data.dspSqlHyst = DEF_DSP_SQL_HYST;
+  data.dspBewMode = DEF_DSP_BEW_MODE;
+  data.dspNarrowBand = false;
   data.rxPgaGain = DEF_RX_PGA_GAIN;
   data.rxDigitalGainPct = DEF_RX_DIGITAL_GAIN_PCT;
   data.enablePLFilter = DEF_PL_FILTER;
@@ -113,6 +180,7 @@ void ConfigManager::resetDefaults() {
 
   // Network
   data.netIface = DEF_NET_IFACE;
+  strlcpy(data.deviceHostname, DEF_DEVICE_HOSTNAME, sizeof(data.deviceHostname));
   data.useStaticIP = DEF_USE_STATIC_IP;
   data.staticIP = (uint32_t)IPAddress(DEF_STATIC_IP);
   data.subnetMask = (uint32_t)IPAddress(DEF_SUBNET_MASK);
@@ -130,5 +198,9 @@ void ConfigManager::resetDefaults() {
   save();
   _gpsTimingDefaults();
   saveGpsTiming();
+  _rptDefaults();
+  saveRpt();
+  _wgDefaults();
+  saveWg();
   Serial.println("[Config] Reset to defaults");
 }

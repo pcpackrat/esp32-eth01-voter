@@ -30,7 +30,11 @@
 #include "Pins.h"
 #include "Version.h"
 #include "VoterClient.h"
+#include "Repeater.h"
 #include "WebUI.h"
+#include "WgTunnel.h"
+#include <esp_sntp.h>
+#include <sys/time.h>
 
 #define VOTER_LOCAL_PORT 8888
 #define FRAME_QUEUE_DEPTH 25 // 500ms of audio
@@ -87,6 +91,88 @@ uint8_t rssiFromCal(float v, float atNoSig, float atFull) {
 // -----------------------------------------------------------------------------
 // RX: radio -> host
 // -----------------------------------------------------------------------------
+// DSP RSSI voice hold (cf. the PIC firmware's DSPBEW option). The PIC uses
+// an FFT; here the voice band (500-2500 Hz) is compared with the noise band
+// (2.8 kHz+) the DSP RSSI measures. Pure FM noise has a fixed ratio between
+// the two for a given radio (rising noise spectrum, the radio's own roll-off),
+// learned while the squelch is closed. A frame well above that ratio is
+// voice: the DSP RSSI keeps its last voice-free value. Hardware RSSI is not
+// affected.
+static const float BEW_VOICE_MIN = 150.0f;     // Q15 RMS (~-47 dBFS): quieter is never voice
+static const int BEW_HOLD_FRAMES = 3;          // keep holding 60 ms after the voice
+static const int BEW_MAX_HOLD_FRAMES = 150;    // never hold longer than 3 s (fading signal)
+static float s_bewRatio = 1.0f;                // learned noise-only voice/noise ratio
+
+// Mode 3, noise floor tracking: DSP RSSI uses the lowest noise reading of the
+// last 300 ms. Speech only ever adds energy and the gaps between syllables
+// show the real noise floor, so voice can't pull RSSI down. Works when the
+// radio's audio leaves only a narrow noise band (e.g. MTR3000, ~2.8-3.5 kHz).
+// A rising signal shows at once; a fade shows after up to 300 ms.
+static const int FLOOR_FRAMES = 15; // 300 ms
+
+static float dspRssiNoise(float noiseRms, float voiceRms, bool sqlOpen) {
+  static float held = 0.0f;
+  static bool heldValid = false;
+  static int holdLeft = 0;
+  static int holdRun = 0;
+  static int frames = 0, heldFrames = 0;
+
+  // Learn the noise-only ratio while the squelch is closed (no signal)
+  if (!sqlOpen && noiseRms > 1.0f) {
+    float r = voiceRms / noiseRms;
+    s_bewRatio += (r - s_bewRatio) * 0.02f;
+    s_bewRatio = constrain(s_bewRatio, 0.05f, 50.0f);
+  }
+
+  uint8_t mode = cfg.data.dspBewMode;
+  if (mode == 3) {
+    static float floorHist[FLOOR_FRAMES];
+    static int floorIdx = 0, floorCount = 0;
+    floorHist[floorIdx] = noiseRms;
+    floorIdx = (floorIdx + 1) % FLOOR_FRAMES;
+    if (floorCount < FLOOR_FRAMES)
+      floorCount++;
+    float floorRms = noiseRms;
+    for (int i = 0; i < floorCount; i++)
+      if (floorHist[i] < floorRms)
+        floorRms = floorHist[i];
+    // "held" = signal present and this frame read 6 dB+ over the floor (voice
+    // in the band). Idle noise alone swings more than 25% frame to frame.
+    heldFrames += (sqlOpen && noiseRms > floorRms * 2.0f) ? 1 : 0;
+    if (++frames >= 50) {
+      g_status.rssiHeldPct = (uint8_t)(heldFrames * 2);
+      frames = heldFrames = 0;
+    }
+    heldValid = false; // voice-hold state restarts if the mode is changed back
+    return floorRms;
+  }
+
+  bool voice = false;
+  if (mode != 0 && voiceRms > BEW_VOICE_MIN) {
+    float k = (mode == 2) ? 1.4f : 2.0f; // sensitive / normal
+    voice = voiceRms > s_bewRatio * k * (noiseRms > 1.0f ? noiseRms : 1.0f);
+  }
+  if (voice)
+    holdLeft = BEW_HOLD_FRAMES;
+
+  bool holding = heldValid && (voice || holdLeft > 0) && holdRun < BEW_MAX_HOLD_FRAMES;
+  if (!voice && holdLeft > 0)
+    holdLeft--;
+  if (holding) {
+    holdRun++;
+  } else {
+    holdRun = 0;
+    held = noiseRms;
+    heldValid = true;
+  }
+  heldFrames += (holding && sqlOpen) ? 1 : 0; // squelch closed: RSSI is 0 anyway
+  if (++frames >= 50) { // once a second
+    g_status.rssiHeldPct = (uint8_t)(heldFrames * 2);
+    frames = heldFrames = 0;
+  }
+  return holding ? held : noiseRms;
+}
+
 // One 20 ms frame: DSP, RSSI, squelch, status. When 'send' is set the frame
 // is on the GPS grid and is queued for the host, stamped 'slot'.
 static void processFrame(int16_t *pcm, bool send, const VTIME &slot) {
@@ -112,13 +198,19 @@ static void processFrame(int16_t *pcm, bool send, const VTIME &slot) {
   g_status.rssiRaw = rssiRaw;
   g_status.noiseRms = noiseRms;
 
+  // DSP RSSI noise, held while someone is talking (sibilants and high
+  // deviation reach the noise band and would pull RSSI down mid-sentence)
+  float rssiNoise = dspRssiNoise(noiseRms, dsp.getVoiceRms(), g_status.cos);
+
   // RSSI 0-255, the same scale as the VOTER boards (chan_voter compares the
-  // raw byte). Uncalibrated DSP RSSI is already 10-255 from dsp.process().
+  // raw byte). Uncalibrated DSP RSSI is 10-255.
   if (cfg.data.useHwRSSI) {
     // rssiMin = counts at no signal, rssiMax = counts at full quieting
     baseRSSI = rssiFromCal(rssiRaw, cfg.data.rssiMin, cfg.data.rssiMax);
   } else if (cfg.data.dspRmsNoSig > 0.0f && cfg.data.dspRmsFull > 0.0f) {
-    baseRSSI = rssiFromCal(noiseRms, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
+    baseRSSI = rssiFromCal(rssiNoise, cfg.data.dspRmsNoSig, cfg.data.dspRmsFull);
+  } else {
+    baseRSSI = dsp.rssiFromNoise(rssiNoise);
   }
 
   // Calibration measurement (started from the web UI)
@@ -257,6 +349,7 @@ static void rxTask(void *arg) {
     if (rawFill >= AUDIO_FRAME_SAMPLES) {
       rawFill = 0;
       g_status.framesCaptured = g_status.framesCaptured + 1;
+      rpt.feedRx(raw, g_status.cos); // offline repeater: raw audio, last squelch state
       if (!locked) {
         memcpy(grid, raw, sizeof(grid));
         processFrame(grid, false, noTime);
@@ -304,14 +397,18 @@ static void netTask(void *arg) {
 static void txTask(void *arg) {
   static uint8_t ulaw[AUDIO_FRAME_SAMPLES];
   static int16_t pcm[AUDIO_FRAME_SAMPLES];
-  const float gain = (float)cfg.data.txGainPct / 100.0f;
   int16_t txPeak = 0;
   int peakFrames = 0;
 
   for (;;) {
-    // jitterBuffer.get() returns 0 while buffering / empty (ulaw = silence)
-    size_t got = voter.jitterBuffer.get(ulaw, AUDIO_FRAME_SAMPLES);
-    dsp.decodeULaw(ulaw, pcm, AUDIO_FRAME_SAMPLES);
+    const float gain = (float)cfg.data.txGainPct / 100.0f; // read each frame so web changes apply live
+    // Offline repeater owns the TX path while active; otherwise host audio.
+    // jitterBuffer.get() returns 0 while buffering / empty (ulaw = silence).
+    size_t got = 0;
+    if (!rpt.fillTx(pcm)) {
+      got = voter.jitterBuffer.get(ulaw, AUDIO_FRAME_SAMPLES);
+      dsp.decodeULaw(ulaw, pcm, AUDIO_FRAME_SAMPLES);
+    }
 
     if (gain != 1.0f) {
       for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
@@ -346,8 +443,13 @@ static void txTask(void *arg) {
 // PTT: keyed while host audio keeps arriving, plus a tail (as TeensyVoter)
 // -----------------------------------------------------------------------------
 static void updatePtt() {
-  uint32_t last = voter.getLastHostAudioTime();
-  bool active = (last != 0) && (millis() - last < cfg.data.pttTailMs);
+  bool active;
+  if (rpt.active()) {
+    active = rpt.keyed(); // offline repeater
+  } else {
+    uint32_t last = voter.getLastHostAudioTime();
+    active = (last != 0) && (millis() - last < cfg.data.pttTailMs);
+  }
   digitalWrite(PIN_PTT, (active != cfg.data.pttInvert) ? HIGH : LOW);
   if (active != g_status.ptt) {
     g_status.ptt = active;
@@ -362,6 +464,31 @@ static bool resolveHost(const char *name, IPAddress &out) {
   if (out.fromString(name))
     return true;
   return WiFi.hostByName(name, out) == 1;
+}
+
+// NTP log. The SNTP callback runs in the network task and the logger is
+// loop-task only, so the callback just leaves the time for updateNtpLog().
+#define NTP_SERVER "pool.ntp.org"
+static const uint32_t NTP_WARN_MS = 60000;
+static volatile uint32_t s_ntpSyncSec = 0;
+static uint32_t s_ntpStartMs = 0; // 0 = nothing to warn about
+
+static void onNtpSync(struct timeval *tv) { s_ntpSyncSec = (uint32_t)tv->tv_sec; }
+
+static void updateNtpLog() {
+  uint32_t sec = s_ntpSyncSec;
+  if (sec != 0) {
+    s_ntpSyncSec = 0;
+    s_ntpStartMs = 0;
+    time_t t = (time_t)sec;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    logger.info("NTP", "Clock set: %04d-%02d-%02d %02d:%02d:%02d UTC", tm.tm_year + 1900, tm.tm_mon + 1,
+                tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+  } else if (s_ntpStartMs != 0 && millis() - s_ntpStartMs > NTP_WARN_MS) {
+    s_ntpStartMs = 0;
+    logger.warn("NTP", "No time from %s after %lu s", NTP_SERVER, (unsigned long)(NTP_WARN_MS / 1000));
+  }
 }
 
 static void onNetworkUp() {
@@ -400,6 +527,21 @@ static void onNetworkUp() {
     } else {
       Serial.printf("[Syslog] Could not resolve %s\r\n", cfg.data.syslogHost);
     }
+  }
+
+  // Wall clock (WireGuard handshakes need real time). GPS sets it too once
+  // locked; NTP covers a unit with no GPS fix yet.
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  configTime(0, 0, NTP_SERVER);
+  s_ntpStartMs = millis();
+  logger.info("NTP", "Started, server %s", NTP_SERVER);
+
+  // WireGuard starts once the network is up (first time only; it rebuilds
+  // itself on later drops / interface changes)
+  static bool wgStarted = false;
+  if (!wgStarted) {
+    wgStarted = true;
+    wgTunnel.begin();
   }
 
   static bool voterStarted = false;
@@ -461,6 +603,12 @@ static void printStatus() {
                 (unsigned long)gpsAudio.resets());
   Serial.printf(" Send age: avg %.1f ms, max %.1f ms (GPS now - frame start)\r\n",
                 (double)g_status.sendAgeAvgMs, (double)g_status.sendAgeMaxMs);
+  char rptState[96];
+  rpt.stateStr(rptState, sizeof(rptState));
+  Serial.printf(" Repeater: %s\r\n", rptState);
+  char wgState[192];
+  wgTunnel.statusText(wgState, sizeof(wgState));
+  Serial.printf(" WireGuard: %s\r\n", wgState);
   Serial.printf(" Heap    : %lu free\r\n", (unsigned long)ESP.getFreeHeap());
   Serial.println("----------------------------------------");
 }
@@ -513,6 +661,15 @@ static void handleSerial() {
   }
 }
 
+// Radio page settings held outside cfg; everything else on that page is read live
+void applyRadioConfig() {
+  if (g_status.codecOk)
+    codec.setPgaGain(cfg.data.rxPgaGain);
+  dsp.setRxDigitalGainPct(cfg.data.rxDigitalGainPct);
+  dsp.setCalib(cfg.data.dspCalib);
+  dsp.setNarrowNoiseBand(cfg.data.dspNarrowBand);
+}
+
 // -----------------------------------------------------------------------------
 // Setup / Loop
 // -----------------------------------------------------------------------------
@@ -547,6 +704,7 @@ void setup() {
   dsp.begin();
   dsp.setRxDigitalGainPct(cfg.data.rxDigitalGainPct);
   dsp.setCalib(cfg.data.dspCalib);
+  dsp.setNarrowNoiseBand(cfg.data.dspNarrowBand);
 
   voter.setTimingOffset(cfg.data.timingOffsetMs);
   voter.jitterBuffer.setLatency(cfg.data.jitterMs);
@@ -561,6 +719,7 @@ void setup() {
   // Audio tasks
   s_frameQueue = xQueueCreate(FRAME_QUEUE_DEPTH, sizeof(AudioFrame));
   gpsAudio.begin(AUDIO_SAMPLE_RATE);
+  rpt.begin();
   // Connect / send only once the audio clock is locked to GPS as well
   voter.setReadyCheck([]() { return gpsAudio.locked(); },
                       []() { return GpsAudio::stateStr(gpsAudio.state()); });
@@ -589,6 +748,16 @@ void loop() {
     gpsAudio.onPps(ppsUs, gps.getEpoch(), dmaCount, dmaUs);
   }
   gpsAudio.tick(millis());
+
+  // System clock from GPS, once a minute
+  static uint32_t lastClockSet = 0;
+  if (gps.isTimeSet() && (lastClockSet == 0 || millis() - lastClockSet > 60000)) {
+    lastClockSet = millis();
+    VTIME t;
+    gps.getNetworkTime(&t, false);
+    struct timeval tv = {(time_t)t.vtime_sec, (suseconds_t)(t.vtime_nsec / 1000)};
+    settimeofday(&tv, nullptr);
+  }
   g_status.clockPpm = gpsAudio.ppm();
   g_status.clockPpmValid = gpsAudio.state() != GpsAudio::NO_PPS;
 
@@ -603,9 +772,12 @@ void loop() {
     onNetworkUp();
   }
   wasUp = up;
+  updateNtpLog();
 
   // 3. Voter protocol (audio frames are sent by netTask), PTT
+  wgTunnel.update();
   voter.update();
+  rpt.update(voter.isConnected(), g_status.cos);
   updatePtt();
 
   // 4. Web UI, syslog, serial
