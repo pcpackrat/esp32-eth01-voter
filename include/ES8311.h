@@ -4,10 +4,10 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-// Minimal ES8311 driver: ADC + DAC, I2S slave, 8 kHz, 16-bit. No MCLK pin -
-// the codec's internal clock comes from SCLK (BCLK = 32 fs = 256 kHz,
-// multiplied x8 to 2.048 MHz = 256 fs). Register sequence follows Espressif's
-// esp_codec_dev ES8311 driver.
+// Minimal ES8311 driver: ADC + DAC, I2S slave, 8 kHz, 16-bit in 32-bit slots.
+// No MCLK pin - the codec's internal clock comes from SCLK (BCLK = 64 fs =
+// 512 kHz, multiplied x4 to 2.048 MHz = 256 fs). Register sequence follows
+// Espressif's esp_codec_dev ES8311 driver.
 class ES8311 {
 public:
   // I2S (BCLK/LRCK) must already be running before calling this.
@@ -17,6 +17,10 @@ public:
   void setPgaGain(uint8_t step);
 
   uint16_t chipId() const { return _chipId; }
+
+  // Serial diagnostic: print registers 0x00-0x45, write one register
+  void dumpRegs();
+  bool writeReg(uint8_t reg, uint8_t val) { return _write(reg, val); }
 
 private:
   TwoWire *_wire = nullptr;

@@ -14,12 +14,12 @@ WT32-ETH01 + ES8311 codec module + GPS + Motorola CDM (16-pin rear accessory con
 │ Rev diode│ │ + divider │ │ + pad     │ │ (open   │ │ series  │ │ + RC   │   │
 │ TSR      │ │           │ │           │ │  drain) │ │         │ │        │   │
 └────┬─────┘ └─────┬─────┘ └─────▲─────┘ └────▲────┘ └────┬────┘ └───┬────┘   │
-     │ 5V          │ MIC1P/N     │ OUTP       │ IO32      │ IO17     │ IO39   │
+     │ 5V          │ MIC         │ OUTP       │ IO32      │ IO17     │ IO39   │
      │             ▼             │            │           │          │        │
      │       ┌──────────────────────┐         │           │          │        │
      │       │  ES8311 module       │ I2C: IO15 SDA, IO14 SCL        │        │
-     │       │  ADC + DAC           │ I2S: IO2 BCLK, IO33 LRCK,      │        │
-     │       │                      │      IO36 DIN, IO12 DOUT       │        │
+     │       │  ADC + DAC           │ I2S: IO2 BCK, IO33 WS,         │        │
+     │       │                      │      IO36 DO, IO12 DI          │        │
      │       └──────────┬───────────┘         │           │          │        │
      ▼                  ▼                     │           ▼          ▼        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -38,13 +38,13 @@ WT32-ETH01 + ES8311 codec module + GPS + Motorola CDM (16-pin rear accessory con
 |---|---|---|---|
 | 5V | in | Power | TSR 1-2450 output (section 6). Also feeds the GPS antenna (V ant, section 8) |
 | GND | — | Ground | Common ground (section 7) |
-| 3V3 | out | 3.3 V | ES8311 module (4.7), GPS board +3.3V (section 8), I2C pull-ups |
-| IO15 | I/O | I2C SDA | ES8311 SDA, 4.7k pull-up to 3V3 |
-| IO14 | out | I2C SCL | ES8311 SCL, 4.7k pull-up to 3V3 |
-| IO2 | out | I2S BCLK | ES8311 SCLK |
-| IO33 (header 485_EN) | out | I2S WS | ES8311 LRCK |
-| IO36 | in | I2S data in | ES8311 ASDOUT |
-| IO12 | out | I2S data out | ES8311 DSDIN |
+| 3V3 | out | 3.3 V | ES8311 module 3V3 (4.7), GPS board +3.3V (section 8), I2C pull-ups |
+| IO15 | I/O | I2C SDA | ES8311 module SDA, 4.7k pull-up to 3V3 |
+| IO14 | out | I2C SCL | ES8311 module SCL, 4.7k pull-up to 3V3 |
+| IO2 | out | I2S BCLK | ES8311 module BCK |
+| IO33 (header 485_EN) | out | I2S WS | ES8311 module WS |
+| IO36 | in | I2S data in | ES8311 module DO |
+| IO12 | out | I2S data out | ES8311 module DI |
 | IO32 (header CFG) | out | PTT | PTT driver (4.6) |
 | IO17 (header TXD) | in | COS | CDM pin 12 through 1k series (4.3) |
 | IO39 | in (ADC1_CH3) | RSSI voltage | RSSI input network (4.4) |
@@ -58,7 +58,7 @@ Do not use IO0, 16, 18, 19, 21, 22, 23, 25, 26, 27. They belong to the LAN8720 E
 **Onboard LEDs on IO5 and IO17.** The header RXD (IO5) and TXD (IO17) pins each drive an activity LED (LED3 / LED4) that lights when the pin is low. LED4 therefore lights while COS is active, and LED3 flickers when the firmware talks to the GPS.
 
 **Strap pins in use:**
-- **IO12 (I2S DOUT)** must be low at boot. High selects 1.8 V flash and the board will not boot. It drives the codec's DSDIN input, which has no pull-up, so it stays low. If the codec module has a pull-up on DSDIN, remove it or fit 10k from IO12 to GND. (LRCK is on IO33 rather than IO12 because codec modules often pull LRCK up.)
+- **IO12 (I2S DOUT)** must be low at boot. High selects 1.8 V flash and the board will not boot. It drives the module's DI pin, which has no pull-up, so it stays low. If the module has a pull-up on DI, remove it or fit 10k from IO12 to GND. (WS is on IO33 rather than IO12 because codec modules often pull WS up.)
 - **IO2 (BCLK)** must be low or floating to flash. Do not pull it up.
 - **IO15 (SDA)** high at boot is normal; the 4.7k pull-up is fine.
 
@@ -87,20 +87,25 @@ The WT32 has no auto-reset. Fit the jumper, power-cycle or reset, flash, remove 
 |---|---|---|
 | SDA | IO15 | 4.7k pull-up to 3V3 (skip if the module has one) |
 | SCL | IO14 | 4.7k pull-up to 3V3 (skip if the module has one) |
-| SCLK (BCLK) | IO2 | No pull-up |
-| LRCK (WS) | IO33 (header 485_EN) | Not a strap pin - a module pull-up here is fine |
-| ASDOUT (DOUT) | IO36 | Codec ADC data to the ESP32 |
-| DSDIN (DIN) | IO12 | ESP32 TX audio to the codec DAC. No pull-up (strap note, section 2) |
-| OUTP / OUTN | — | DAC output, to the radio TX audio (4.5) |
-| MCLK | — | Leave open, or tie to GND if it floats |
-| CE / AD0 | GND | I2C address 0x18 |
-| VCC / GND | 3V3 / GND | Section 4.7 |
+| BCK | IO2 | I2S bit clock. No pull-up |
+| WS | IO33 (header 485_EN) | I2S word select. Not a strap pin - a module pull-up here is fine |
+| DO | IO36 | Codec ADC data to the ESP32 |
+| DI | IO12 | ESP32 TX audio to the codec DAC. No pull-up (strap note, section 2) |
+| MCK | — | Leave open, or tie to GND if it floats |
+| 3V3 | 3V3 | Codec supply, section 4.7 |
+| VCC | — | Leave open (not traced; likely the NS4150 amp supply) |
+| GND | GND | Section 4.7 |
+| MIC connector | — | RX audio input (4.2) |
+| SPK connector | — | Leave open. TX audio is taken at the codec OUTP pin (4.5), not here |
+| PA_EN pad | — | NS4150 enable. Ground it to keep the amp off (4.5) |
 
-- **No MCLK.** The ESP32 can only output MCLK on IO0, IO1 or IO3. IO0 is the Ethernet clock and IO1/IO3 are the console. The ES8311 takes its clock from BCLK instead.
+- **I2C address** is set on the module (CE/AD0 is not on the header). Firmware expects 0x18 (`ES8311_I2C_ADDR`, include/Pins.h). If the boot log shows `[ES8311] No response`, try 0x19.
+
+- **No MCLK (MCK pin open).** The ESP32 can only output MCLK on IO0, IO1 or IO3. IO0 is the Ethernet clock and IO1/IO3 are the console. The ES8311 takes its clock from BCLK instead.
 - Keep the I2S wires short (under ~10 cm). BCLK is only 256 kHz, but a long BCLK wire still couples into the audio.
 - **Check:** the boot log shows `[ES8311] Init OK (ID 0x8311)`, and the status page shows Codec OK. If the codec is found but "ADC peak" shows no level with audio applied, flip `AUDIO_RX_SLOT` in include/AudioCodec.h and rebuild.
 
-### 4.2 RX audio → ES8311 MIC1P / MIC1N
+### 4.2 RX audio → ES8311 module MIC connector (MIC1P / MIC1N)
 
 ```
 CDM 11 ──C1 10µF NP──R1 10k──┬─────────┬──────C2 1µF──── MIC1P
@@ -119,7 +124,7 @@ CDM 7 (audio return) ────────┴─────────┴�
 
 - MIC1N goes to the radio's audio return, not to local GND. The codec input is differential, so ground noise between the radio and the WT32 is rejected.
 - Run CDM 11 and the audio return as a twisted pair or shielded cable. Ground the shield at the radio end only.
-- If the module has an onboard mic, remove it or cut its traces to MIC1P/N. Firmware keeps the mic bias off.
+- MIC1P is the MIC connector pin marked + on the silkscreen; the other pin is MIC1N. Confirm with a meter (continuity to the codec pins) before wiring. Firmware keeps the mic bias off, so the connector shows no DC.
 - **Level:** full-deviation voice should give "ADC peak" about -6 to -10 dBFS on the status page. Adjust R2 first, then the codec PGA (Radio page, 0-30 dB), then Digital Gain. Trim Digital Gain for "Encoder peak" -3 to -6 dB.
 
 ### 4.3 COS → IO17
@@ -174,7 +179,7 @@ ES8311 OUTN ── leave open
 | R10 / R11 | 10k / 1k | Level pad, about -21 dB to start. Larger R11 = louder |
 
 - OUTP/OUTN are a differential pair biased at mid-supply. Taking OUTP alone, through C10, gives half the swing, which is plenty for a radio line input.
-- **Take the signal at the codec pins, before any speaker amplifier on the module.** Many ES8311 modules have an amp (e.g. NS4150) after OUTP/OUTN. Its output is bridged and must not be grounded on one side. Remove the speaker, and disable or lift the amp if it loads the outputs.
+- **OUTP is not on the header.** Tap it at the codec side of the module, before the NS4150B speaker amp, not at the SPK connector. The SPK output is bridged and must not be grounded on one side. Leave the speaker off and ground the PA_EN pad (it has a 10k pull-up to 3.3 V) to keep the amp off.
 - Run CDM 5 and ground as a twisted pair or shielded cable, shield grounded at the radio end only.
 - **Level:** set a monitor receiver or service monitor on the transmitter. Send full-level audio from the host (a test tone through the node). Pick R11 so TX Gain (Radio page) near 100 % gives normal deviation, then trim with TX Gain. The status page shows "DAC peak" while host audio plays.
 
@@ -204,7 +209,7 @@ GND ─────────────┴───────────�
 ### 4.7 Codec power
 
 ```
-WT32 3V3 ──FB2──┬────────┬──────── ES8311 module VCC (AVDD/DVDD)
+WT32 3V3 ──FB2──┬────────┬──────── ES8311 module 3V3 (AVDD/DVDD)
                 │        │
               C5 10µF  C6 100nF
                 │        │
@@ -212,6 +217,7 @@ GND ────────────┴────────┴───�
 ```
 
 - FB2 (600 Ω @ 100 MHz) keeps WT32 digital noise off the codec analog supply. The ES8311 draws about 10-20 mA.
+- Leave the module VCC pin open. Check with a meter that 3V3 reaches the codec and VCC feeds only the amp.
 - Bring the module GND to the single ground point (section 7), right next to the WT32 GND pin.
 
 ### 4.8 CDM 1250 accessory connector
@@ -280,7 +286,7 @@ That is about 100-140 mA from 13.8 V through the TSR (about 90% efficient), well
 ## 7. Grounding and layout
 
 - One ground point: radio GND, TSR GND, WT32 GND, ES8311 GND and GPS GND meet at one spot near the WT32 GND pin.
-- Keep the ES8311 module close to the WT32 (short I2S wires), its input network (4.2) right at MIC1P/N, and the TX pad (4.5) right at OUTP.
+- Keep the ES8311 module close to the WT32 (short I2S wires), its input network (4.2) right at the MIC connector, and the TX pad (4.5) right at OUTP.
 - Keep the TX audio and PTT wires away from the RX audio pair. Ground the TX audio return at CDM 7, not at the WT32.
 - Route RX audio and its return as a twisted pair or shielded cable from the CDM connector. Ground the shield at the radio end only.
 - Keep the RSSI divider and C5 close to IO39.

@@ -33,7 +33,10 @@
 #include "Repeater.h"
 #include "WebUI.h"
 #include "WgTunnel.h"
+#include <driver/gpio.h>
+#include <esp_rom_gpio.h>
 #include <esp_sntp.h>
+#include <soc/gpio_sig_map.h>
 #include <sys/time.h>
 
 #define VOTER_LOCAL_PORT 8888
@@ -361,6 +364,20 @@ static void rxTask(void *arg) {
 // -----------------------------------------------------------------------------
 // Network send: frames go out as soon as they are made (not via the main loop)
 // -----------------------------------------------------------------------------
+// Client send phase: age (GPS now - frame start) at which a client sends.
+// A frame is complete at 20 ms; the master sends then. Clients wait until
+// 30 ms so they never reach the host in the same ms as the master's packet.
+// chan_voter places client audio against the newest master time it has, so
+// a client arriving with the master lands in one of two slots 20 ms apart.
+static const double CLIENT_SEND_AGE_MS = 30.0;
+
+static double frameAgeMs(const VTIME &frame) {
+  VTIME now;
+  gps.getNetworkTime(&now, false);
+  return (double)(int32_t)(now.vtime_sec - frame.vtime_sec) * 1000.0 +
+         ((double)now.vtime_nsec - (double)frame.vtime_nsec) / 1e6;
+}
+
 static void netTask(void *arg) {
   AudioFrame f;
   double sum = 0.0, mx = 0.0;
@@ -369,14 +386,16 @@ static void netTask(void *arg) {
   for (;;) {
     if (xQueueReceive(s_frameQueue, &f, portMAX_DELAY) != pdTRUE)
       continue;
+    if (!voter.sendAlways()) {
+      double wait = CLIENT_SEND_AGE_MS - frameAgeMs(f.time);
+      if (wait >= 1.0)
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait));
+    }
     voter.processAudioFrame(f.ulaw, f.rssi, f.time);
 
     // Age at send = GPS now - frame start. For a master this is part of every
     // site's TX timing, so it is measured, not assumed.
-    VTIME now;
-    gps.getNetworkTime(&now, false);
-    double age = (double)(int32_t)(now.vtime_sec - f.time.vtime_sec) * 1000.0 +
-                 ((double)now.vtime_nsec - (double)f.time.vtime_nsec) / 1e6;
+    double age = frameAgeMs(f.time);
     sum += age;
     if (age > mx)
       mx = age;
@@ -649,11 +668,35 @@ static void handleSerial() {
         Serial.println("Rebooting...");
         delay(100);
         ESP.restart();
+      } else if (strcmp(line, "codec") == 0) {
+        int16_t l, r;
+        uint32_t nz, tot;
+        codecIo.slotPeaks(&l, &r, &nz, &tot); // clear, then measure 1 s
+        delay(1000);
+        codecIo.slotPeaks(&l, &r, &nz, &tot);
+        Serial.printf("I2S RX 1 s: peak L %d, R %d, nonzero %lu of %lu words (RX slot %d)\r\n", l, r,
+                      (unsigned long)nz, (unsigned long)tot, AUDIO_RX_SLOT);
+        Serial.println("ES8311 registers:");
+        codec.dumpRegs();
+      } else if (strncmp(line, "creg ", 5) == 0) {
+        unsigned reg, val;
+        if (sscanf(line + 5, "%x %x", &reg, &val) == 2 && reg <= 0xFF && val <= 0xFF) {
+          bool ok = codec.writeReg((uint8_t)reg, (uint8_t)val);
+          Serial.printf("ES8311 reg %02X = %02X %s\r\n", reg, val, ok ? "OK" : "FAILED");
+        } else {
+          Serial.println("Usage: creg <reg hex> <value hex>, e.g. creg 02 10");
+        }
+      } else if (strcmp(line, "dswap") == 0) {
+        // Test for swapped DI/DO labels: stop driving IO12 and read the I2S
+        // data input from IO12 instead of IO36. Reboot to undo.
+        gpio_set_direction((gpio_num_t)PIN_I2S_DOUT, GPIO_MODE_INPUT);
+        esp_rom_gpio_connect_in_signal(PIN_I2S_DOUT, I2S0I_DATA_IN15_IDX, false);
+        Serial.println("I2S data in now from IO12 (module DI), TX off. Run 'codec'. Reboot to undo.");
       } else if (strcmp(line, "reset") == 0) {
         Serial.print("Erase all settings and restore factory defaults? Are you sure? (y/N): ");
         resetAskedAt = millis();
       } else {
-        Serial.println("Commands: status, reboot, reset (factory defaults)");
+        Serial.println("Commands: status, codec, creg <reg> <val>, dswap, reboot, reset (factory defaults)");
       }
     } else if (len < (int)sizeof(line) - 1) {
       line[len++] = c;
@@ -699,7 +742,15 @@ void setup() {
   // BCLK), then configure the codec
   g_status.audioOk = codecIo.begin(PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DOUT, PIN_I2S_DIN);
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
-  g_status.codecOk = codec.begin(&Wire, ES8311_I2C_ADDR, cfg.data.rxPgaGain);
+  // Cold power-on: the codec isn't always ready yet, so give it time and retry
+  delay(100);
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    g_status.codecOk = codec.begin(&Wire, ES8311_I2C_ADDR, cfg.data.rxPgaGain);
+    if (g_status.codecOk || attempt == 5)
+      break;
+    Serial.printf("[ES8311] Init attempt %d failed, retrying\r\n", attempt);
+    delay(200);
+  }
 
   dsp.begin();
   dsp.setRxDigitalGainPct(cfg.data.rxDigitalGainPct);

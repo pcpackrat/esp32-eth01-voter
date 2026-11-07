@@ -50,9 +50,10 @@ bool ES8311::begin(TwoWire *wire, uint8_t addr, uint8_t pgaGain) {
   // Clock manager: all clocks on, internal MCLK from SCLK (bit7 = 1)
   ok &= _write(0x01, 0xBF);
 
-  // SCLK 256 kHz x8 = 2.048 MHz internal (256 fs), 8 kHz. Same dividers as
-  // the Espressif table entry {2048000, 8000}, plus pre_multi = x8.
-  ok &= _write(0x02, 0x18); // pre_div = 1, pre_multi = x8
+  // SCLK 512 kHz (64 fs) x4 = 2.048 MHz internal (256 fs), 8 kHz. Same
+  // dividers as the Espressif table entry {2048000, 8000}. Was x8 from
+  // 256 kHz, which never ran (datasheet: x4/x8 need a faster input clock).
+  ok &= _write(0x02, 0x10); // pre_div = 1, pre_multi = x4
   ok &= _write(0x05, 0x00); // adc_div = 1, dac_div = 1
   ok &= _write(0x03, 0x10); // single speed, adc_osr = 0x10
   ok &= _write(0x04, 0x10); // dac_osr = 0x10
@@ -89,6 +90,24 @@ bool ES8311::begin(TwoWire *wire, uint8_t addr, uint8_t pgaGain) {
   Serial.printf("[ES8311] Init OK (ID 0x%04X), PGA %u dB\r\n", _chipId,
                 (unsigned)(pgaGain * 3));
   return true;
+}
+
+void ES8311::dumpRegs() {
+  for (int r = 0; r <= 0x45; r++) {
+    if (r % 16 == 0)
+      Serial.printf("%s%02X:", r ? "\r\n" : "", r);
+    int v = _read(r);
+    if (v < 0)
+      Serial.print(" --");
+    else
+      Serial.printf(" %02X", v);
+  }
+  int flag = _read(0xFC);
+  if (flag < 0)
+    Serial.print("\r\nFC: --\r\n");
+  else
+    Serial.printf("\r\nFC: %02X (state machine S%d, ADC automute %d)\r\n", flag, (flag >> 4) & 7,
+                  (flag >> 1) & 1);
 }
 
 void ES8311::setPgaGain(uint8_t step) {

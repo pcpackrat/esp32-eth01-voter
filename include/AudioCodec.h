@@ -29,6 +29,10 @@ public:
   void dmaSnapshot(uint64_t *count, int64_t *us);
   // Times the reader fell behind the capture ring and skipped ahead
   uint32_t rxOverflows() const;
+
+  // Serial diagnostic: peak raw value on each I2S slot (L, R) since the last
+  // call, plus how many samples were nonzero
+  void slotPeaks(int16_t *left, int16_t *right, uint32_t *nonzero, uint32_t *total);
 };
 
 #endif
