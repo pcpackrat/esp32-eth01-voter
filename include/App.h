@@ -50,6 +50,19 @@ struct RssiCalMeasure {
 };
 extern RssiCalMeasure g_rssiCal;
 
+// TX test tone, started from the Test Tone page. The TX task plays it in place
+// of host audio (through TX Gain) and PTT stays keyed until untilMs.
+struct TestTone {
+  volatile uint16_t hz;
+  volatile float amp;        // peak, 16-bit full scale = 32767
+  volatile uint32_t untilMs; // millis() end time, 0 = off
+};
+extern TestTone g_testTone;
+inline bool testToneActive() {
+  uint32_t until = g_testTone.untilMs;
+  return until != 0 && (int32_t)(until - millis()) > 0;
+}
+
 // Map v to RSSI 0-255, linear between the no-signal and full-quieting
 // readings. Works either way round (RSSI voltage or noise falling with signal).
 uint8_t rssiFromCal(float v, float atNoSig, float atFull);

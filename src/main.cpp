@@ -79,6 +79,7 @@ static uint16_t readRssiRaw() {
 }
 
 RssiCalMeasure g_rssiCal = {};
+TestTone g_testTone = {};
 
 uint8_t rssiFromCal(float v, float atNoSig, float atFull) {
   if (atFull == atNoSig)
@@ -418,13 +419,23 @@ static void txTask(void *arg) {
   static int16_t pcm[AUDIO_FRAME_SAMPLES];
   int16_t txPeak = 0;
   int peakFrames = 0;
+  float tonePhase = 0.0f;
 
   for (;;) {
     const float gain = (float)cfg.data.txGainPct / 100.0f; // read each frame so web changes apply live
-    // Offline repeater owns the TX path while active; otherwise host audio.
+    // Test tone, then offline repeater, then host audio.
     // jitterBuffer.get() returns 0 while buffering / empty (ulaw = silence).
     size_t got = 0;
-    if (!rpt.fillTx(pcm)) {
+    if (testToneActive()) {
+      const float step = 2.0f * (float)M_PI * (float)g_testTone.hz / (float)AUDIO_SAMPLE_RATE;
+      const float amp = g_testTone.amp;
+      for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+        pcm[i] = (int16_t)(amp * sinf(tonePhase));
+        tonePhase += step;
+        if (tonePhase >= 2.0f * (float)M_PI)
+          tonePhase -= 2.0f * (float)M_PI;
+      }
+    } else if (!rpt.fillTx(pcm)) {
       got = voter.jitterBuffer.get(ulaw, AUDIO_FRAME_SAMPLES);
       dsp.decodeULaw(ulaw, pcm, AUDIO_FRAME_SAMPLES);
     }
@@ -463,7 +474,9 @@ static void txTask(void *arg) {
 // -----------------------------------------------------------------------------
 static void updatePtt() {
   bool active;
-  if (rpt.active()) {
+  if (testToneActive()) {
+    active = true;
+  } else if (rpt.active()) {
     active = rpt.keyed(); // offline repeater
   } else {
     uint32_t last = voter.getLastHostAudioTime();
@@ -706,8 +719,11 @@ static void handleSerial() {
 
 // Radio page settings held outside cfg; everything else on that page is read live
 void applyRadioConfig() {
-  if (g_status.codecOk)
-    codec.setPgaGain(cfg.data.rxPgaGain);
+  // Applied even when init reported a failed write: the chip still answers,
+  // and skipping it left PGA changes ignored until the next boot.
+  bool pgaOk = codec.setPgaGain(cfg.data.rxPgaGain);
+  Serial.printf("[ES8311] PGA %u dB %s\r\n", (unsigned)(cfg.data.rxPgaGain * 3),
+                pgaOk ? "set" : "write FAILED (REG14 readback mismatch)");
   dsp.setRxDigitalGainPct(cfg.data.rxDigitalGainPct);
   dsp.setCalib(cfg.data.dspCalib);
   dsp.setNarrowNoiseBand(cfg.data.dspNarrowBand);
@@ -731,7 +747,7 @@ void setup() {
   pinMode(PIN_PTT, OUTPUT);
   digitalWrite(PIN_PTT, cfg.data.pttInvert ? HIGH : LOW);
 
-  // COS: direct from radio (active low) via 1k series, internal pull-up
+  // COS: direct from radio (active low) via BAT85 series diode, internal pull-up
   pinMode(PIN_COS, INPUT_PULLUP);
 
   // Hardware RSSI input

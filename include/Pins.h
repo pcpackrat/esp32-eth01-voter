@@ -28,7 +28,7 @@
 #define GPS_BAUD 9600
 
 // --- Radio ---
-// COS direct from the radio (active low) through 1k series, internal pull-up.
+// COS direct from the radio (active low) through a BAT85 series diode, internal pull-up.
 // Header TXD pin. LED4 lights while COS is active.
 #define PIN_COS 17
 // Hardware RSSI voltage. ADC1 (ADC2 pins don't work while WiFi runs).

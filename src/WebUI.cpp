@@ -1,6 +1,7 @@
 #include "WebUI.h"
 #include "App.h"
 #include "Config.h"
+#include "ConfigBackup.h"
 #include "Defaults.h"
 #include "Logger.h"
 #include "NetManager.h"
@@ -86,7 +87,7 @@ static String htmlHeader(const char *title) {
   // Device name first (tells units apart), then the device type
   html += "<h1>" + htmlEscape(cfg.data.deviceHostname) + "</h1>";
   html += "<div class=\"dev\">" FIRMWARE_NAME " v" FIRMWARE_VERSION "</div>";
-  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/repeater\">Repeater</a><a href=\"/wireguard\">WireGuard</a><a href=\"/update\">Firmware</a></div>";
+  html += "<div class=\"nav\"><a href=\"/\">Status</a><a href=\"/voter\">Voter</a><a href=\"/radio\">Radio</a><a href=\"/tone\">Test Tone</a><a href=\"/network\">Network</a><a href=\"/wifi\">WiFi</a><a href=\"/gps\">GPS</a><a href=\"/repeater\">Repeater</a><a href=\"/wireguard\">WireGuard</a><a href=\"/backup\">Backup</a><a href=\"/update\">Firmware</a></div>";
   return html;
 }
 
@@ -372,6 +373,47 @@ static void handleRadio() {
   webServer.send(200, "text/html", html);
 }
 
+// ---------------------------------------------------------------------------
+// TX test tone
+// ---------------------------------------------------------------------------
+static uint16_t s_toneHz = 1000; // last entered values, shown again after Start/Stop
+static int s_toneDbfs = -20;
+static int s_toneSecs = 5;
+
+static void handleTone() {
+  String html = htmlHeader("Test Tone");
+  html += "<div class=\"card\"><h2>TX Test Tone</h2><form method=\"POST\" action=\"/tone\">";
+  html += "<p>Keys PTT and sends a sine tone through TX Gain in place of host audio. "
+          "Compare levels at different frequencies on a receiver or service monitor.</p>";
+  html += "<label>Frequency (Hz, 50-3500):</label><input type=\"number\" min=\"50\" max=\"3500\" name=\"hz\" value=\"" +
+          String(s_toneHz) + "\">";
+  html += "<label>Level (dBFS, -40 to 0):</label><input type=\"number\" min=\"-40\" max=\"0\" name=\"dbfs\" value=\"" +
+          String(s_toneDbfs) + "\">";
+  html += "<label>Duration (s, 1-60):</label><input type=\"number\" min=\"1\" max=\"60\" name=\"secs\" value=\"" +
+          String(s_toneSecs) + "\">";
+  html += String("<p>Tone is ") + (testToneActive() ? "<b>ON</b> (" + String(g_testTone.hz) + " Hz)" : String("off")) + ".</p>";
+  html += "<input type=\"submit\" name=\"go\" value=\"Start\" class=\"btn\"> "
+          "<input type=\"submit\" name=\"stop\" value=\"Stop\" class=\"btn\"></form></div>";
+  html += htmlFooter();
+  webServer.send(200, "text/html", html);
+}
+
+static void handleTonePost() {
+  s_toneHz = (uint16_t)constrain(webServer.arg("hz").toInt(), 50, 3500);
+  s_toneDbfs = constrain(webServer.arg("dbfs").toInt(), -40, 0);
+  s_toneSecs = constrain(webServer.arg("secs").toInt(), 1, 60);
+  if (webServer.hasArg("stop")) {
+    g_testTone.untilMs = 0;
+  } else {
+    g_testTone.hz = s_toneHz;
+    g_testTone.amp = 32767.0f * powf(10.0f, (float)s_toneDbfs / 20.0f);
+    uint32_t until = millis() + (uint32_t)s_toneSecs * 1000;
+    g_testTone.untilMs = until ? until : 1;
+  }
+  webServer.sendHeader("Location", "/tone", true);
+  webServer.send(303, "text/plain", "");
+}
+
 static void handleRadioPost() {
   uint16_t oldJitterMs = cfg.data.jitterMs;
   cfg.data.cosMode = (uint8_t)constrain(webServer.arg("cosMode").toInt(), 0, 2);
@@ -494,24 +536,43 @@ static void handleWiFi() {
     html += "<p>Auto mode (Network page): WiFi is used whenever no Ethernet cable is connected.</p>";
   }
   html += "<p>2.4 GHz networks only.</p>";
+  if (net.mode() == NetMode::WIFI_ACTIVE) {
+    html += "<p><span class=\"status ok\">Connected</span> \"" + htmlEscape(WiFi.SSID().c_str()) + "\" (network " +
+            String(net.wifiNetIndex() + 1) + "), " + String(WiFi.RSSI()) + " dBm</p>";
+  }
   html += "<form method=\"POST\" action=\"/wifi\">";
+  html += "<label>Connect to:</label><select name=\"pin\">";
+  html += String("<option value=\"auto\"") + (cfg.wifiNets.pinned >= WIFI_MAX_NETS ? " selected" : "") +
+          ">Auto - strongest saved network in range</option>";
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    html += "<option value=\"" + String(i) + "\"" + (cfg.wifiNets.pinned == i ? " selected" : "") + ">Network " +
+            String(i + 1) + " only" + (cfg.wifiSsid(i)[0] ? String(" (") + htmlEscape(cfg.wifiSsid(i)) + ")" : String("")) +
+            "</option>";
+  }
+  html += "</select>";
   html += "<button type=\"button\" class=\"btn\" onclick=\"scanWifi()\">Scan for Networks</button>";
-  html += "<div id=\"scanStatus\"></div>";
-  html += "<select id=\"scanResults\" style=\"display:none\" onchange=\"document.getElementById('ssidInput').value=this.value\"></select>";
-  html += "<label>SSID:</label><input type=\"text\" id=\"ssidInput\" name=\"ssid\" maxlength=\"32\" value=\"" + htmlEscape(cfg.data.wifiSSID) + "\">";
-  html += "<label>Password:</label><input type=\"password\" id=\"wifiPass\" name=\"pass\" maxlength=\"64\" value=\"" + htmlEscape(cfg.data.wifiPass) + "\">";
-  html += "<label><input type=\"checkbox\" onclick=\"toggleShow('wifiPass')\"> Show</label>";
+  html += "<div id=\"scanStatus\"></div><datalist id=\"scanList\"></datalist>";
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    bool saved = cfg.wifiSsid(i)[0] != '\0';
+    html += "<h3>Network " + String(i + 1) + "</h3>";
+    html += "<label>SSID:</label><input type=\"text\" name=\"ssid" + String(i) +
+            "\" list=\"scanList\" maxlength=\"32\" value=\"" + htmlEscape(cfg.wifiSsid(i)) + "\">";
+    html += "<label>Password:</label><input type=\"password\" class=\"wpass\" name=\"pass" + String(i) +
+            "\" maxlength=\"64\"" +
+            (saved && cfg.wifiPass(i)[0] ? " placeholder=\"saved - leave blank to keep\"" : "") + ">";
+  }
+  html += "<label><input type=\"checkbox\" onclick=\"var t=this.checked?'text':'password';"
+          "document.querySelectorAll('.wpass').forEach(function(e){e.type=t;})\"> Show passwords</label>";
+  html += "<p>Clear an SSID to delete that network. Passwords are never shown once saved.</p>";
   html += "<input type=\"submit\" value=\"Save &amp; Reboot\" class=\"btn\"></form></div>";
   html += "<script>";
   html += "function scanWifi(){document.getElementById('scanStatus').innerText='Scanning...';fetch('/wifi/scan',{method:'POST'}).then(pollScan);}";
   html += "function pollScan(){fetch('/wifi/scan_results').then(function(r){return r.text();}).then(function(text){"
           "if(text==='running'){setTimeout(pollScan,1000);return;}"
           "var networks=text.split('\\n').filter(function(s){return s.length>0;});"
-          "var sel=document.getElementById('scanResults');"
-          "sel.innerHTML='<option value=\"\">-- Select a network --</option>';"
-          "networks.forEach(function(ssid){var opt=document.createElement('option');opt.value=ssid;opt.text=ssid;sel.appendChild(opt);});"
-          "sel.style.display=networks.length?'block':'none';"
-          "document.getElementById('scanStatus').innerText=networks.length?(networks.length+' networks found'):'No networks found';"
+          "var dl=document.getElementById('scanList');dl.innerHTML='';"
+          "networks.forEach(function(ssid){var opt=document.createElement('option');opt.value=ssid;dl.appendChild(opt);});"
+          "document.getElementById('scanStatus').innerText=networks.length?('Found: '+networks.join(', ')+' - pick one in an SSID box'):'No networks found';"
           "});}";
   html += "</script>";
   html += htmlFooter();
@@ -553,9 +614,19 @@ static void handleWifiScanResults() {
 }
 
 static void handleWiFiPost() {
-  strlcpy(cfg.data.wifiSSID, webServer.arg("ssid").c_str(), sizeof(cfg.data.wifiSSID));
-  strlcpy(cfg.data.wifiPass, webServer.arg("pass").c_str(), sizeof(cfg.data.wifiPass));
+  for (int i = 0; i < WIFI_MAX_NETS; i++) {
+    String ssid = webServer.arg("ssid" + String(i));
+    String pass = webServer.arg("pass" + String(i));
+    // Blank password on an unchanged SSID keeps the saved one
+    if (ssid.length() && pass.length() == 0 && ssid == cfg.wifiSsid(i))
+      pass = cfg.wifiPass(i);
+    cfg.setWifi(i, ssid.length() ? ssid.c_str() : "", ssid.length() ? pass.c_str() : "");
+  }
+  String pin = webServer.arg("pin");
+  int p = pin == "auto" ? -1 : pin.toInt();
+  cfg.wifiNets.pinned = (p >= 0 && p < WIFI_MAX_NETS && cfg.wifiSsid(p)[0]) ? (uint8_t)p : WIFI_PIN_AUTO;
   cfg.save();
+  cfg.saveWifiNets();
   scheduleReboot();
   sendRedirectToRebooting();
 }
@@ -1152,6 +1223,79 @@ static void handleUpdateDone() {
 }
 
 // ---------------------------------------------------------------------------
+// Backup / restore of every stored setting (JSON, checked against DEVICE_TYPE)
+// ---------------------------------------------------------------------------
+static const size_t IMPORT_MAX = 16384;
+static String s_importBuf;
+static bool s_importTooBig = false;
+
+static void handleBackup() {
+  String html = htmlHeader("Backup");
+  html += "<div class=\"card\"><h2>Export Settings</h2>"
+          "<p>Downloads every setting as a JSON file: voter, radio and RSSI/DSP calibration, "
+          "network, WiFi, syslog, GPS, repeater and WireGuard. The file contains passwords and "
+          "the WireGuard private key - keep it private.</p>"
+          "<a href=\"/backup/export\" class=\"btn\">Download</a></div>";
+  html += "<div class=\"card\"><h2>Import Settings</h2>"
+          "<p>Only a file exported from a <b>" DEVICE_TYPE "</b> device is accepted. "
+          "Settings missing from the file keep their current value. "
+          "The device saves and reboots; network settings from the file take effect after the reboot.</p>"
+          "<form method=\"POST\" action=\"/backup/import\" enctype=\"multipart/form-data\" "
+          "onsubmit=\"return confirm('Replace the settings on this device with the file and reboot?');\">"
+          "<label>Settings file (.json):</label>"
+          "<input type=\"file\" name=\"config\" accept=\".json,application/json\" required>"
+          "<input type=\"submit\" value=\"Import &amp; Reboot\" class=\"btn\"></form></div>";
+  html += htmlFooter();
+  webServer.send(200, "text/html", html);
+}
+
+static void handleBackupExport() {
+  String name = cfg.data.deviceHostname[0] ? String(cfg.data.deviceHostname) : String(DEVICE_TYPE);
+  webServer.sendHeader("Content-Disposition",
+                       "attachment; filename=\"" + name + "-" DEVICE_TYPE "-config.json\"");
+  webServer.send(200, "application/json", configExportJson());
+}
+
+static void handleBackupUpload() {
+  HTTPUpload &up = webServer.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    s_importBuf = "";
+    s_importBuf.reserve(4096);
+    s_importTooBig = false;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (s_importBuf.length() + up.currentSize > IMPORT_MAX)
+      s_importTooBig = true;
+    else
+      s_importBuf.concat((const char *)up.buf, up.currentSize);
+  }
+}
+
+static void handleBackupImport() {
+  String err;
+  bool ok = false;
+  if (s_importTooBig)
+    err = "file is too large for a settings file";
+  else if (s_importBuf.length() == 0)
+    err = "no file received";
+  else
+    ok = configImportJson(s_importBuf.c_str(), s_importBuf.length(), err);
+  s_importBuf = "";
+  if (ok) {
+    logger.info("CFG", "Settings imported from file, rebooting");
+    scheduleReboot();
+    sendRedirectToRebooting();
+    return;
+  }
+  logger.warn("CFG", "Settings import rejected: %s", err.c_str());
+  String html = htmlHeader("Backup");
+  html += "<div class=\"card\"><h2><span class=\"status warn\">Import Rejected</span></h2>";
+  html += "<p>" + htmlEscape(err.c_str()) + "</p><p>The settings on this device are unchanged.</p>";
+  html += "<a href=\"/backup\" class=\"btn\">Back</a></div>";
+  html += htmlFooter();
+  webServer.send(400, "text/html", html);
+}
+
+// ---------------------------------------------------------------------------
 
 static void redirectToSetup() {
   webServer.sendHeader("Location", "http://" + net.apIP().toString() + "/wifi", true);
@@ -1165,6 +1309,8 @@ void webBegin() {
   webServer.on("/voter", HTTP_POST, handleVoterPost);
   webServer.on("/radio", HTTP_GET, handleRadio);
   webServer.on("/radio", HTTP_POST, handleRadioPost);
+  webServer.on("/tone", HTTP_GET, handleTone);
+  webServer.on("/tone", HTTP_POST, handleTonePost);
   webServer.on("/network", HTTP_GET, handleNetwork);
   webServer.on("/network", HTTP_POST, handleNetworkPost);
   webServer.on("/wifi", HTTP_GET, handleWiFi);
@@ -1185,6 +1331,9 @@ void webBegin() {
   webServer.on("/gps", HTTP_POST, handleGpsPost);
   webServer.on("/gps/aid", HTTP_POST, handleGpsAidPost);
   webServer.on("/gps/cold", HTTP_POST, handleGpsColdPost);
+  webServer.on("/backup", HTTP_GET, handleBackup);
+  webServer.on("/backup/export", HTTP_GET, handleBackupExport);
+  webServer.on("/backup/import", HTTP_POST, handleBackupImport, handleBackupUpload);
   webServer.on("/update", HTTP_GET, handleUpdate);
   webServer.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
 

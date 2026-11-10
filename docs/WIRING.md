@@ -19,7 +19,7 @@ WT32-ETH01 + ES8311 codec module + GPS + Motorola CDM (16-pin rear accessory con
      │       ┌──────────────────────┐         │           │          │        │
      │       │  ES8311 module       │ I2C: IO15 SDA, IO14 SCL        │        │
      │       │  ADC + DAC           │ I2S: IO2 BCK, IO33 WS,         │        │
-     │       │                      │      IO36 DO, IO12 DI          │        │
+     │       │                      │      IO36 DI, IO12 DO          │        │
      │       └──────────┬───────────┘         │           │          │        │
      ▼                  ▼                     │           ▼          ▼        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -43,10 +43,10 @@ WT32-ETH01 + ES8311 codec module + GPS + Motorola CDM (16-pin rear accessory con
 | IO14 | out | I2C SCL | ES8311 module SCL, 4.7k pull-up to 3V3 |
 | IO2 | out | I2S BCLK | ES8311 module BCK |
 | IO33 (header 485_EN) | out | I2S WS | ES8311 module WS |
-| IO36 | in | I2S data in | ES8311 module DO |
-| IO12 | out | I2S data out | ES8311 module DI |
+| IO36 | in | I2S data in | ES8311 module **DI** (codec ASDOUT, see 4.1) |
+| IO12 | out | I2S data out | ES8311 module **DO** (codec DSDIN, see 4.1) |
 | IO32 (header CFG) | out | PTT | PTT driver (4.6) |
-| IO17 (header TXD) | in | COS | CDM pin 12 through 1k series (4.3) |
+| IO17 (header TXD) | in | COS | CDM pin 12 through BAT85 series diode (4.3) |
 | IO39 | in (ADC1_CH3) | RSSI voltage | RSSI input network (4.4) |
 | IO35 | in | GPS NMEA | GPS TXD (section 8) |
 | IO4 | in | GPS PPS | GPS PPS / 1PPS (section 8) |
@@ -58,7 +58,7 @@ Do not use IO0, 16, 18, 19, 21, 22, 23, 25, 26, 27. They belong to the LAN8720 E
 **Onboard LEDs on IO5 and IO17.** The header RXD (IO5) and TXD (IO17) pins each drive an activity LED (LED3 / LED4) that lights when the pin is low. LED4 therefore lights while COS is active, and LED3 flickers when the firmware talks to the GPS.
 
 **Strap pins in use:**
-- **IO12 (I2S DOUT)** must be low at boot. High selects 1.8 V flash and the board will not boot. It drives the module's DI pin, which has no pull-up, so it stays low. If the module has a pull-up on DI, remove it or fit 10k from IO12 to GND. (WS is on IO33 rather than IO12 because codec modules often pull WS up.)
+- **IO12 (I2S DOUT)** must be low at boot. High selects 1.8 V flash and the board will not boot. It drives the module's DO pin (codec DSDIN), which has no pull-up, so it stays low. If the module has a pull-up on that pin, remove it or fit 10k from IO12 to GND. (WS is on IO33 rather than IO12 because codec modules often pull WS up.)
 - **IO2 (BCLK)** must be low or floating to flash. Do not pull it up.
 - **IO15 (SDA)** high at boot is normal; the 4.7k pull-up is fine.
 
@@ -89,8 +89,10 @@ The WT32 has no auto-reset. Fit the jumper, power-cycle or reset, flash, remove 
 | SCL | IO14 | 4.7k pull-up to 3V3 (skip if the module has one) |
 | BCK | IO2 | I2S bit clock. No pull-up |
 | WS | IO33 (header 485_EN) | I2S word select. Not a strap pin - a module pull-up here is fine |
-| DO | IO36 | Codec ADC data to the ESP32 |
-| DI | IO12 | ESP32 TX audio to the codec DAC. No pull-up (strap note, section 2) |
+| DI | IO36 | Codec ADC data (ASDOUT) to the ESP32 |
+| DO | IO12 | ESP32 TX audio to the codec DAC (DSDIN). No pull-up (strap note, section 2) |
+
+**DI / DO are labelled from the MCU's side**, not the codec's: module DI = data into the MCU (codec ASDOUT), module DO = data out of the MCU (codec DSDIN). Wiring DO→IO36 / DI→IO12 gives no RX audio. Confirmed on the bench: RX audio only arrives with DI→IO36.
 | MCK | — | Leave open, or tie to GND if it floats |
 | 3V3 | 3V3 | Codec supply, section 4.7 |
 | VCC | — | Leave open (not traced; likely the NS4150 amp supply) |
@@ -129,15 +131,18 @@ CDM 7 (audio return) ────────┴─────────┴�
 
 ### 4.3 COS → IO17
 
-Direct connection. The CDM COS output is active low.
+Series Schottky diode, cathode toward the radio. The CDM COS output is active low.
 
 ```
-CDM pin 12 ──R7 1k── IO17     (firmware enables the internal ~45k pull-up)
-CDM pin 7  ───────── GND
+                  D3 BAT85
+CDM pin 12 ──────|◄───────── IO17     (firmware enables the internal ~45k pull-up)
+           (cathode)  (anode)
+CDM pin 7  ───────────────── GND
 ```
 
-- R7 (1k) protects IO17 in case the radio drives the line while the pin is misconfigured.
-- It doesn't affect reading. With the radio pulling low, IO17 sits at about 0.07 V (3.3 V × 1k / 46k), well below the ~0.8 V LOW threshold.
+- Radio pulls low: D3 conducts and IO17 sits at the diode drop, about 0.25-0.35 V at the pull-up + LED4 current. That's below the ESP32 LOW threshold (0.25 × 3.3 V ≈ 0.8 V).
+- Radio high or open: D3 blocks and the pull-up takes IO17 to 3.3 V. The radio can never drive IO17 above 3.3 V, whatever its high level is.
+- Use a Schottky (BAT85, ~0.3 V). A silicon 1N4148 (~0.6-0.7 V) leaves too little margin to the LOW threshold.
 - Radio COS **low** = signal present → firmware sees "active" with Invert COS **off** (default).
 - The onboard LED4 is wired to this pin and lights while COS is active. Its path to 3V3 also helps the pull-up.
 - **Check:** with the radio unplugged, IO17 reads about 3.3 V. On the status page, COS shows OPEN (and LED4 lights) only while a signal is present.
@@ -228,7 +233,7 @@ GND ────────────┴────────┴───�
 | 5 | TX audio input (flat) | 4.5 TX audio (R10/R11) |
 | 7 | GROUND | System ground, the RX audio return (MIC1N side) and the TX audio ground |
 | 11 | FLAT/FILTERED_RX_AUDIO, set to **Flat Unsquelched** in CPS | 4.2 input (C1) |
-| 12 | DIG_IN_OUT_7, programmed in CPS as channel activity / carrier detect | 4.3 COS input (R7) |
+| 12 | DIG_IN_OUT_7, programmed in CPS as channel activity / carrier detect | 4.3 COS input (D3) |
 | 13 | SWB+ (follows radio power switch) | Power input, section 6 |
 | 15 | RSSI | 4.4 RSSI input (R12) |
 
@@ -245,29 +250,37 @@ IO32 is the header pin labelled CFG. In the stock Wireless-Tag AT firmware it is
 
 Regulator: **TRACO TSR 1-2450** (5 V, 1 A, ~6.5-36 V in, 3-pin SIP: 1 = +Vin, 2 = GND, 3 = +Vout).
 
+All capacitors and the TVS are shunts (rail to GND). Only F1, D1 and FB1 are in series with the supply.
+
 ```
-CDM 13 SWB+  ──F1──D1──►──┬──────────┬──────────┬──── pin 1    ┌────────────┐
- (13.8 V)      PTC  SS34  │          │          │              │ TSR 1-2450 │
-              500mA      TVS1      C1 10µF    C2 100nF         │            │
-                         SMBJ18A   50V cer.     │      ┌─pin 2 │            │
-                          │          │          │      │       └─────┬──────┘
-CDM 7 GND ────────────────┴──────────┴──────────┴──────┘             │ pin 3
-                                                                     │
-                          ┌──────────────────────────────────────────┘
-                          │
-                          ├── C3 22µF ──┬── C4 100nF ──FB1──► WT32 5V
-                          │             │                     (onboard AMS1117 makes 3V3)
-GND (pin 2) ──────────────┴─────────────┴──────────────────► WT32 GND
+Input side:
+
+CDM 13 SWB+ ──F1──D1──►──┬─────────┬─────────┬──────── TSR pin 1 (+Vin)
+ (13.8 V)     PTC  SS34  │         │         │
+             500mA     TVS1     C1 10µF   C2 100nF
+                      SMBJ18A   50V cer.     │
+                         │         │         │
+CDM 7 GND ───────────────┴─────────┴─────────┴──────── TSR pin 2 (GND)
+
+
+Output side:
+
+TSR pin 3 (+5V) ──┬─────────┬────────FB1────────┬──────► WT32 5V
+                  │         │                   │        (onboard AMS1117 makes 3V3)
+               C3 22µF   C4 100nF            C5 10µF
+                  │         │                   │
+TSR pin 2 (GND) ──┴─────────┴───────────────────┴──────► WT32 GND
 ```
 
 | Part | Value | Notes |
 |---|---|---|
 | F1 | PTC 500 mA hold | Protects the radio's switched B+ line |
 | D1 | SS34 Schottky, series | Reverse-polarity protection (~0.4 V drop) |
-| TVS1 | SMBJ18A | 18 V standoff, clamps ~29 V. Below the TSR's 36 V input maximum |
-| C1 / C2 | 10 µF 50 V ceramic / 100 nF | TSR input, right at pin 1-2 |
-| C3 / C4 | 22 µF 10 V / 100 nF | TSR output, right at pin 3-2 |
-| FB1 | Ferrite bead, 600 Ω @ 100 MHz | Keeps switching noise off the WT32 rail |
+| TVS1 | SMBJ18A, rail to GND | 18 V standoff, clamps ~29 V. Below the TSR's 36 V input maximum |
+| C1 / C2 | 10 µF 50 V ceramic / 100 nF, rail to GND | TSR input, right at pin 1-2 |
+| C3 / C4 | 22 µF 10 V / 100 nF, rail to GND | TSR output, right at pin 3-2 |
+| FB1 | Ferrite bead, 600 Ω @ 100 MHz, ≥1 A rated, low DCR | Series in the 5 V line. Keeps switching noise off the WT32 rail |
+| C5 | 10 µF 10 V ceramic, rail to GND | At the WT32 5V/GND pins, after FB1. Supplies the WiFi current peaks the bead would otherwise starve |
 
 The TSR runs without external caps. C1-C4 are there to keep its switching noise off the radio cable and the WT32 rail. Check the TRACO datasheet for the recommended values.
 
@@ -321,6 +334,16 @@ WT32-ETH01                        WD22UGRC 8-pin header
 | PPS | IO4 | LEA-5T TIMEPULSE, 1 pulse/s, rising edge. Firmware enables the internal pull-down |
 | RxD | IO5 | Lets the firmware set up timing mode (GPS web page). Without it the GPS still works, but timing mode can't be turned on |
 
+ Ribbon cable
+1 - 5v
+2 - 3.3v
+3 - TXD
+4 - GND/NC
+5 - RXD
+6 - PPS
+7 - GND/NC
+8 - GND
+
 | Part | Value | Notes |
 |---|---|---|
 | C6 / C7 | 10 µF / 100 nF | At the board's +3.3V pin. Covers the acquisition current peaks |
@@ -331,3 +354,16 @@ WT32-ETH01                        WD22UGRC 8-pin header
 - Keep the antenna cable away from the TSR.
 - **Timing mode** (GPS web page): the LEA-5T surveys its position once, saves it, then keeps time on as little as 1 satellite. Use it at a fixed site with a poor sky view. The status page shows survey progress and the fixed position.
 - **Check:** on the status page, NMEA data shows good sentences, PPS shows OK (1 Hz), GPS = LOCKED, and the audio clock locks to GPS about 10-20 s later. With RxD wired, the Timing mode line shows the module answered (Off / Survey-in / Fixed).
+
+## 9. Terminal block
+
+1 - RSSI
+2 - COS
+3 - PTT
+4 - RX IN
+5 - TX OUT
+6 - PTT
+7 - Serial RX
+8 - Serial TX
+9 - 6-15v +
+10 - GND
